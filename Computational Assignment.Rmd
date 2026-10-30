@@ -1,0 +1,104 @@
+---
+title: "Case Analysis"
+author: "Can"
+date: "2026-10-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Computational Assignment Markdown
+
+In this markdown, we analyse the provided ScanRecords.csv file and determine the unknown elements of the data.
+
+```{r imports, echo=FALSE}
+# first, need to import relevant packages and set the seed for our random processes
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+
+set.seed(333)
+
+data <- read.csv("ScanRecords.csv")
+
+# we convert the fraction of hours into minutes/hours in case we want to use it like this
+data <- data %>%
+  mutate(
+    Minutes = (Duration * 60)
+  )
+data
+
+```
+
+# Data Exploration
+
+We have a few things we know about the data:
+
++ All series are independent and identically distributed
++ Patient 1:
+    - The duration of scans are normally distributed
+    - Patients arrive according to a Poisson distribution 
+
+Let's first explore the data a little. Our focus is to find how the duration and arrival time are distributed, so we consider them first. 
+We start with the duration of scans.
+
+```{r}
+# look at how the duration of scans for each patient are spread
+# use dplyr since it makes the data into a table dataframe automatically, makes it easier to work with
+# for now use Minutes instead of Duration, but can switch it to Duration for equivalent results
+dura <- data %>%
+  group_by(PatientType) %>%
+  summarise(
+    SD = sd(Minutes),
+    Max = max(Minutes),
+    Qrt3 = quantile(Minutes, probs = 0.75),
+    Mean = mean(Minutes),
+    Qrt1 = quantile(Minutes, probs = 0.25),
+    Min = min(Minutes)
+  )
+dura
+
+# make the boxplot of the duration and the summary stats we find
+boxDura <- ggplot(data, aes(x = PatientType, y = Minutes, fill = PatientType)) +
+  geom_boxplot() +
+  labs(title = "MRI Scan Durations by Patient Type", 
+       x = "Patient Type", 
+       y = "Duration (minutes)") +
+  stat_boxplot(geom = "errorbar", width = 0.2) +
+  scale_y_continuous(breaks = seq(0, ceiling(max(data$Duration)), by = 0.25)) +
+  theme_minimal()
+
+# want to visualise the statistics together with the boxplot, so use the gridExtra package to place them together
+tdura <- t(dura)
+duraVisual <- tableGrob(tdura)
+
+grid.arrange(boxDura, duraVisual, ncol = 2, widths = c(2, 1.35))
+
+
+
+```
+The dots are outliers, which here are categorised as being more than 1.5 times the interquartile range above the third quartile, or below the first quartile.
+
+We can now look at the arrivals.
+
+```{r}
+# look at how many of each patient arrive each day
+dailyCount <- table(data$Date, data$PatientType)
+print(dailyCount)
+
+# now find the inter-arrival times
+# know the distribution of 
+```
+
+
+
+# Finding the Distributions
+
+Now that we have the preliminary information, we can use this to find the distributions of the durations and arrival times for each patient.
+
+As the case for Patient Type 1 is straight forward, we look at that first.
+
+```{r}
+```
