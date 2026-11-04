@@ -153,9 +153,14 @@ samplesd <- dura %>%
   filter(PatientType == "Type 1") %>% 
   pull(SD)  
 
+samplearrmu <- mean(arr1$InterArrivalTimeMinutes)
+lambda1 <- 1 / samplearrmu
+
 # now prep for the bootstrap
 # set the  number of runs and a matrix to hold the means for dura and arr
-nlen <- length(data$Minutes)
+nlendura <- length(data$Minutes)
+nlenarr1 <- length(arr1$InterArrivalTimeMinutes)
+
 B <- 10000
 meansdura <- numeric(length = B) 
 sdsdura <- numeric(length = B)
@@ -165,13 +170,16 @@ meansarr <- numeric(length = B)
 # now do a for loop where we do a bunch of normals to find the "true" mean
 for (i in 1:B) {
   # generate normal based on params for duration
-  samplebootdura <- rnorm(n = nlen, mean = samplemu, sd = samplesd)
+  samplebootdura <- rnorm(n = nlendura, mean = samplemu, sd = samplesd)
   meansdura[i] <- mean(samplebootdura)
   sdsdura[i] <- sd(samplebootdura)
   
   # generate exponential based on params for arrival
-#  samplebootarr <- rexp(n = nlen, rate = )
+  samplebootarr <- rexp(n = nlenarr1, rate = lambda1)
+  meansarr[i] <- mean(samplebootarr)
 }
+
+## for duration
 
 ci_lower <- quantile(meansdura, 0.025)
 ci_upper <- quantile(meansdura, 0.975)
@@ -183,14 +191,27 @@ cat("95% CI for : [", round(ci_lower, 4), ",", round(ci_upper, 4), "]\n")
 # plot these to make it clear how the bootstrap and sample params interact
 par(mfrow = c(1, 2)) 
 # plot distribution of simulated means
-hist(means, main = "Bootstrap Distribution: Mean", xlab = "Simulated Means (minutes)", col = "lightblue", border = "white")
+hist(meansdura, main = "Bootstrap Distribution: Mean", xlab = "Simulated Means (minutes)", col = "lightblue", border = "white")
 abline(v = samplemu, col = "red", lwd = 2, lty = 2) # Marks the baseline mean
 
 # plot distribution of simulated standard deviations
-hist(sds, main = "Bootstrap Distribution: SD",  xlab = "Simulated SDs (minutes)", col = "lightgreen", border = "white")
+hist(sdsdura, main = "Bootstrap Distribution: SD",  xlab = "Simulated SDs (minutes)", col = "lightgreen", border = "white")
 abline(v = samplesd, col = "red", lwd = 2, lty = 2) # Marks the baseline SD
 # Reset plotting layout to default
 par(mfrow = c(1, 1))
+
+## for arrival
+
+ci_arrival_lower <- quantile(meansarr, 0.025)
+ci_arrival_upper <- quantile(meansarr, 0.975)
+
+cat("Baseline Mean Inter-Arrival:", round(samplearrmu, 4), "hours\n")
+cat("95% CI: [", round(ci_arrival_lower, 4), ",", round(ci_arrival_upper, 4), "]\n")
+
+hist(meansarr, main = "Bootstrap Distribution: Inter-Arrival Mean", 
+     xlab = "Simulated Means (hours)", col = "orange", border = "white")
+abline(v = samplearrmu, col = "black", lwd = 2, lty = 2)
+
 ```
 
 # Patient Type 2
