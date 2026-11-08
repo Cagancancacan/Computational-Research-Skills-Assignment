@@ -1,0 +1,366 @@
+# =====================================================================
+# Type2_analysis.R
+# Statistical analysis of Patient Type 2 (distributions unknown)
+#
+# What this script does
+#   1. Prepares the data (fixes the DayIndex issue, see note below)
+#   2. Explores Type 2: scan durations, patients per day, inter-arrival times
+#   3. Plug-in estimates + NON-parametric bootstrap CIs for quantities the
+#      hospital can interpret (mean, quantiles, P(scan > slot), patients/day)
+#   4. Alternative: fit lognormal / gamma + PARAMETRIC bootstrap, compare
+#   5. Small Monte Carlo study: how reliable are the two approaches when the
+#      true distribution is known (correct model vs. wrong model)?
+#   6. Saves the inputs needed by the discrete event simulation
+#
+# Put ScanRecords.csv in the same folder as this script (or set the path).
+# Needs: dplyr, ggplot2, MASS (MASS ships with R)
+# =====================================================================
+
+library(dplyr)
+library(ggplot2)
+
+set.seed(333)
+
+# ---------------------------------------------------------------------
+# 0. Settings
+# ---------------------------------------------------------------------
+csv_file    <- "ScanRecords.csv"
+type2_label <- "Type 2"      # how Type 2 is written in the PatientType column
+quick       <- FALSE         # TRUE = fast test run (fewer replications)
+
+B     <- 10000   # bootstrap replications (final analysis)
+M     <- 500     # Monte Carlo replications
+B_mc  <- 300     # bootstrap replications inside each Monte Carlo replication
+conf  <- 0.95    # confidence level
+if (quick) { B <- 1000; M <- 100; B_mc <- 100 }
+
+dir.create("figures", showWarnings = FALSE)
+alpha <- (1 - conf) / 2
+
+# ---------------------------------------------------------------------
+# 1. Data preparation
+# ---------------------------------------------------------------------
+data <- read.csv(csv_file)
+data$PatientType <- as.factor(data$PatientType)
+data$Minutes     <- data$Duration * 60
+
+# Convert Date to a number so that days are ordered correctly.
+# (Try a few common formats; check the result if your dates look like 03/11/2025,
+#  since day/month vs month/day is ambiguous.)
+parse_dates <- function(x) {
+  for (f in c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d")) {
+    d <- as.Date(x, format = f)
+    if (!any(is.na(d))) return(as.numeric(d))
+  }
+  warning("Could not parse Date: using order of appearance instead")
+  match(x, unique(x))
+}
+data$DateNum <- parse_dates(data$Date)
+
+# NOTE: DayIndex is computed on ALL patients (both types), not per type.
+# Otherwise a day without any Type 2 call would vanish and the continuous
+# time would be shortened.
+all_days     <- sort(unique(data$DateNum))
+n_days       <- length(all_days)
+data$DayIndex <- match(data$DateNum, all_days) - 1      # 0, 1, ..., n_days-1
+
+t2 <- data %>%
+  filter(PatientType == type2_label) %>%
+  arrange(DayIndex, Time) %>%
+  mutate(ContinuousTime = DayIndex * 9 + (Time - 8))    # hours since day 0, 8:00;
+                                                        # nights are skipped
+
+dur  <- t2$Minutes                                      # scan durations (minutes)
+n2   <- length(dur)
+
+# Patients per day (days with 0 Type 2 patients count as 0)
+counts <- tabulate(t2$DayIndex + 1, nbins = n_days)
+
+# Inter-arrival times in minutes (no time elapses outside working hours)
+ia <- diff(t2$ContinuousTime) * 60
+
+cat("\n=== Type 2: basic facts ===\n")
+cat("Number of working days in data:", n_days, "\n")
+cat("Number of Type 2 patients:     ", n2, "\n")
+cat("Mean patients per day:         ", round(mean(counts), 2), "\n")
+
+# ---------------------------------------------------------------------
+# 2. Exploration
+# ---------------------------------------------------------------------
+cat("\n=== Durations (minutes) ===\n")
+print(summary(dur))
+cat("SD:", round(sd(dur), 2), " Skewness:",
+    round(mean((dur - mean(dur))^3) / sd(dur)^3, 2), "\n")
+
+cat("\n=== Patients per day: is it Poisson? ===\n")
+disp   <- var(counts) / mean(counts)                    # =1 for Poisson
+p_up   <- pchisq((n_days - 1) * disp, df = n_days - 1, lower.tail = FALSE)
+p_disp <- min(1, 2 * min(p_up, 1 - p_up))
+cat("Mean:", round(mean(counts), 2), " Variance:", round(var(counts), 2),
+    " Dispersion index (var/mean):", round(disp, 2),
+    " two-sided p-value:", round(p_disp, 3), "\n")
+
+cat("\n=== Inter-arrival times: exponential? ===\n")
+cat("Mean (min):", round(mean(ia), 2), " SD/mean (=1 if exponential):",
+    round(sd(ia) / mean(ia), 2), "\n")
+ks <- suppressWarnings(ks.test(ia, "pexp", rate = 1 / mean(ia)))
+cat("KS test vs exponential (approximate, rate estimated): p =",
+    round(ks$p.value, 3), "\n")
+
+cat("\nPatients per day (in date order):", counts, "\n")
+cat("Range of daily counts:", min(counts), "-", max(counts), "\n")
+# Shape of a gamma fitted to inter-arrival times: shape = 1 would be exponential;
+# shape >> 1 means very regular arrivals (CV = 1/sqrt(shape))
+ia_gamma <- suppressWarnings(
+  MASS::fitdistr(ia[ia > 0], "gamma", start = list(shape = 1 / (sd(ia) / mean(ia))^2,
+                                                    rate  = 1 / (mean(ia) * (sd(ia) / mean(ia))^2))))
+cat("Gamma fit to inter-arrival times: shape =", round(ia_gamma$estimate["shape"], 2),
+    "(1 = exponential)\n")
+if (disp < 0.5 || sd(ia) / mean(ia) < 0.7)
+  cat(">> Type 2 arrivals look MORE REGULAR than Poisson/exponential. Do NOT use a",
+      "Poisson model for Type 2 in the simulation; resample the observed daily counts instead.\n")
+
+# Time of day of the calls (are calls spread evenly over 8:00-17:00?)
+p_tod <- ggplot(t2, aes(Time)) +
+  geom_histogram(breaks = 8:17, fill = "steelblue", colour = "white") +
+  labs(title = "Type 2: time of day of calls", x = "Hour of day", y = "Calls") +
+  theme_minimal()
+
+# ---------------------------------------------------------------------
+# 3. Quantities the hospital can interpret
+# ---------------------------------------------------------------------
+# thr = candidate slot lengths (minutes). P(scan > thr) = probability that a
+# scan overruns a slot of that length. ADAPT these to the slot lengths you
+# want to discuss; by default they are the (rounded) median and 3rd quartile.
+thr <- unique(as.numeric(round(quantile(dur, c(0.5, 0.75)) / 5) * 5))
+
+dur_stats <- function(x, thr) {
+  c(mean   = mean(x),
+    median = median(x),
+    q80    = unname(quantile(x, 0.80)),
+    q90    = unname(quantile(x, 0.90)),
+    q95    = unname(quantile(x, 0.95)),
+    setNames(sapply(thr, function(t) mean(x > t)), paste0("P(>", thr, "min)")))
+}
+
+# Generic non-parametric bootstrap: resample WITH replacement from the data
+boot_np <- function(x, stat_fun, B) {
+  t(replicate(B, stat_fun(sample(x, length(x), replace = TRUE))))
+}
+
+ci_table <- function(est, bt, label) {
+  data.frame(quantity = names(est),
+             estimate = unname(est),
+             lower    = unname(apply(bt, 2, quantile, probs = alpha)),
+             upper    = unname(apply(bt, 2, quantile, probs = 1 - alpha)),
+             method   = label, row.names = NULL)
+}
+
+# 3a. Durations: plug-in estimates + non-parametric bootstrap (percentile CI)
+est_np <- dur_stats(dur, thr)
+bt_np  <- boot_np(dur, function(z) dur_stats(z, thr), B)
+res_dur_np <- ci_table(est_np, bt_np, "plug-in + nonparametric bootstrap")
+
+cat("\n=== Type 2 durations: plug-in estimates with", conf * 100, "% bootstrap CI ===\n")
+print(res_dur_np %>% mutate(across(c(estimate, lower, upper), ~ round(.x, 3))))
+
+# 3b. Arrivals
+# Patients per day: resample DAYS (days are i.i.d. by assumption)
+count_stats <- function(cn) c(mean_per_day = mean(cn),
+                              sd_per_day   = sd(cn),
+                              q90_per_day  = unname(quantile(cn, 0.90)),
+                              max_per_day  = max(cn))
+est_cnt <- count_stats(counts)
+bt_cnt  <- boot_np(counts, count_stats, B)
+res_cnt <- ci_table(est_cnt, bt_cnt, "plug-in + nonparametric bootstrap")
+
+# Inter-arrival time: resample the gaps (i.i.d. by assumption)
+ia_stats <- function(z) c(mean_interarrival_min = mean(z),
+                          median_interarrival_min = median(z))
+est_ia <- ia_stats(ia)
+bt_ia  <- boot_np(ia, ia_stats, B)
+res_ia <- ci_table(est_ia, bt_ia, "plug-in + nonparametric bootstrap")
+
+cat("\n=== Type 2 arrivals ===\n")
+print(rbind(res_cnt, res_ia) %>% mutate(across(c(estimate, lower, upper), ~ round(.x, 3))))
+
+# ---------------------------------------------------------------------
+# 4. Alternative: fit a distribution + parametric bootstrap
+# ---------------------------------------------------------------------
+# Gamma MLE with method-of-moments starting values (avoids "NaNs produced"
+# warnings from the optimizer; the warnings are harmless but noisy)
+fit_gamma <- function(x) {
+  m <- mean(x); v <- var(x)
+  suppressWarnings(MASS::fitdistr(x, "gamma", start = list(shape = m^2 / v, rate = m / v)))
+}
+
+fit_ln <- MASS::fitdistr(dur, "lognormal")
+fit_ga <- tryCatch(fit_gamma(dur), error = function(e) NULL)
+
+aic_tab <- data.frame(distribution = "lognormal", AIC = AIC(fit_ln))
+if (!is.null(fit_ga)) aic_tab <- rbind(aic_tab, data.frame(distribution = "gamma", AIC = AIC(fit_ga)))
+cat("\n=== Fitted distributions for Type 2 durations (lower AIC = better) ===\n")
+print(aic_tab)
+
+best <- if (is.null(fit_ga) || AIC(fit_ln) <= AIC(fit_ga)) "lognormal" else "gamma"
+cat("Best fit:", best, "\n")
+
+if (best == "lognormal") {
+  p_ml <- fit_ln$estimate["meanlog"]; p_sl <- fit_ln$estimate["sdlog"]
+  gen_fit <- function(n) rlnorm(n, p_ml, p_sl)
+  refit   <- function(x) { ml <- mean(log(x)); sl <- sqrt(mean((log(x) - ml)^2))
+                           function(n) rlnorm(n, ml, sl) }
+} else {
+  gen_fit <- function(n) rgamma(n, shape = fit_ga$estimate["shape"], rate = fit_ga$estimate["rate"])
+  refit   <- function(x) { f <- fit_gamma(x)
+                           function(n) rgamma(n, f$estimate["shape"], f$estimate["rate"]) }
+}
+
+# Parametric bootstrap: simulate n2 durations from the fitted model, re-fit, recompute
+est_par <- dur_stats(gen_fit(1e6), thr)                 # model-based estimate
+bt_par  <- t(replicate(B, {
+  xb <- gen_fit(n2)
+  g  <- tryCatch(refit(xb), error = function(e) gen_fit)
+  dur_stats(g(5e4), thr)       # statistic of the re-fitted model (approximated by 50k draws)
+}))
+res_dur_par <- ci_table(est_par, bt_par, paste("fitted", best, "+ parametric bootstrap"))
+
+cat("\n=== Comparison of the two approaches (durations) ===\n")
+comp <- rbind(res_dur_np, res_dur_par) %>%
+  mutate(across(c(estimate, lower, upper), ~ round(.x, 3))) %>%
+  arrange(quantity, method)
+print(comp)
+
+# Figures
+p_hist <- ggplot(t2, aes(Minutes)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 20, fill = "grey85", colour = "white") +
+  stat_function(fun = dlnorm, args = list(meanlog = fit_ln$estimate["meanlog"], sdlog = fit_ln$estimate["sdlog"]),
+                aes(colour = "Lognormal"), linewidth = 1) +
+  { if (!is.null(fit_ga)) stat_function(fun = dgamma,
+      args = list(shape = fit_ga$estimate["shape"], rate = fit_ga$estimate["rate"]),
+      aes(colour = "Gamma"), linewidth = 1) } +
+  labs(title = "Type 2 scan durations with fitted densities", x = "Duration (minutes)",
+       y = "Density", colour = "Fit") + theme_minimal()
+
+p_ecdf <- ggplot(t2, aes(Minutes)) + stat_ecdf(linewidth = 1) +
+  labs(title = "Type 2: empirical CDF of scan duration",
+       x = "Duration (minutes)", y = "P(duration <= x)") + theme_minimal()
+
+p_cnt <- ggplot(data.frame(n = counts), aes(n)) +
+  geom_bar(aes(y = after_stat(prop)), fill = "steelblue") +
+  geom_point(data = data.frame(k = 0:max(counts), p = dpois(0:max(counts), mean(counts))),
+             aes(k, p), colour = "red", size = 2) +
+  labs(title = "Type 2: patients per day (bars) vs Poisson (red dots)",
+       x = "Patients per day", y = "Proportion of days") + theme_minimal()
+
+p_ia <- ggplot(data.frame(ia = ia), aes(ia)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 25, fill = "grey85", colour = "white") +
+  stat_function(fun = dexp, args = list(rate = 1 / mean(ia)), colour = "red", linewidth = 1) +
+  labs(title = "Type 2: inter-arrival times vs exponential (red)",
+       x = "Minutes between calls (working time)", y = "Density") + theme_minimal()
+
+ggsave("figures/type2_hist_durations.png", p_hist, width = 7, height = 4.5)
+ggsave("figures/type2_ecdf_durations.png", p_ecdf, width = 7, height = 4.5)
+ggsave("figures/type2_daily_counts.png",   p_cnt,  width = 7, height = 4.5)
+ggsave("figures/type2_interarrival.png",   p_ia,   width = 7, height = 4.5)
+ggsave("figures/type2_time_of_day.png",    p_tod,  width = 7, height = 4.5)
+
+# ---------------------------------------------------------------------
+# 5. Monte Carlo study: how good are the two approaches?
+#    We simulate samples of the SAME size as our data from a distribution we
+#    know, apply both methods, and check against the true value:
+#      - bias and RMSE of the estimates
+#      - coverage of the 95% CI (should be close to 95%)
+#      - CI width (shorter is better, if coverage is fine)
+#    Scenario A: truth is lognormal  -> fitted lognormal is the CORRECT model
+#    Scenario B: truth is a bimodal mixture -> fitted lognormal is WRONG
+#    Plug-in + nonparametric bootstrap never assumes a shape, so it should
+#    still behave well in B; the parametric method may not.
+# ---------------------------------------------------------------------
+ml0 <- mean(log(dur)); sl0 <- sqrt(mean((log(dur) - ml0)^2))
+
+gen_A <- function(n) rlnorm(n, ml0, sl0)
+gen_B <- function(n) {
+  first <- runif(n) < 0.7
+  ifelse(first, rlnorm(n, ml0 - 0.25, sl0 * 0.6), rlnorm(n, ml0 + 0.6, sl0 * 0.6))
+}
+
+# analytic statistics of a lognormal (fast; used for the parametric method)
+lnorm_stats <- function(ml, sl, thr) {
+  c(mean   = exp(ml + sl^2 / 2),
+    median = exp(ml),
+    q80    = qlnorm(0.80, ml, sl),
+    q90    = qlnorm(0.90, ml, sl),
+    q95    = qlnorm(0.95, ml, sl),
+    setNames(1 - plnorm(thr, ml, sl), paste0("P(>", thr, "min)")))
+}
+
+mc_study <- function(true_gen, scenario, n, M, B, thr) {
+  truth <- dur_stats(true_gen(2e6), thr)       # "true" values (very large sample)
+  k <- length(truth)
+  out <- list()
+  est <- array(NA, c(M, k, 2)); lo <- est; hi <- est   # [rep, quantity, method]
+  for (m in 1:M) {
+    x <- true_gen(n)
+    # method 1: plug-in + nonparametric bootstrap
+    e1 <- dur_stats(x, thr)
+    b1 <- boot_np(x, function(z) dur_stats(z, thr), B)
+    est[m, , 1] <- e1
+    lo[m, , 1]  <- apply(b1, 2, quantile, probs = alpha)
+    hi[m, , 1]  <- apply(b1, 2, quantile, probs = 1 - alpha)
+    # method 2: lognormal fit + parametric bootstrap
+    ml <- mean(log(x)); sl <- sqrt(mean((log(x)-ml)^2))
+    e2 <- lnorm_stats(ml, sl, thr)
+    b2 <- t(replicate(B, { xb <- rlnorm(n, ml, sl)
+                           lnorm_stats(mean(log(xb)), sqrt(mean((log(xb)-mean(log(xb)))^2)), thr) }))
+    est[m, , 2] <- e2
+    lo[m, , 2]  <- apply(b2, 2, quantile, probs = alpha)
+    hi[m, , 2]  <- apply(b2, 2, quantile, probs = 1 - alpha)
+  }
+  methods <- c("plug-in + nonparametric bootstrap", "lognormal + parametric bootstrap")
+  do.call(rbind, lapply(1:2, function(j) {
+    data.frame(scenario = scenario, method = methods[j], quantity = names(truth),
+               truth    = unname(truth),
+               mean_est = colMeans(est[, , j]),
+               bias     = colMeans(est[, , j]) - truth,
+               rmse     = sqrt(colMeans((est[, , j] - rep(truth, each = M))^2)),
+               coverage = colMeans(lo[, , j] <= rep(truth, each = M) & rep(truth, each = M) <= hi[, , j]),
+               width    = colMeans(hi[, , j] - lo[, , j]), row.names = NULL)
+  }))
+}
+
+cat("\n=== Monte Carlo study (n =", n2, ", M =", M, "replications) ===\n")
+mc_A <- mc_study(gen_A, "A: truth lognormal (model correct)", n2, M, B_mc, thr)
+mc_B <- mc_study(gen_B, "B: truth bimodal mixture (model wrong)", n2, M, B_mc, thr)
+mc   <- rbind(mc_A, mc_B)
+print(mc %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+p_mc <- ggplot(mc, aes(quantity, coverage, fill = method)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = conf, linetype = "dashed") +
+  facet_wrap(~ scenario, ncol = 1) +
+  coord_cartesian(ylim = c(0.5, 1)) +
+  labs(title = "Monte Carlo: coverage of the 95% bootstrap CI",
+       subtitle = "Dashed line = nominal 95%", x = NULL, y = "Coverage") +
+  theme_minimal() + theme(legend.position = "bottom", axis.text.x = element_text(angle = 30, hjust = 1))
+ggsave("figures/type2_montecarlo_coverage.png", p_mc, width = 8, height = 7)
+
+# ---------------------------------------------------------------------
+# 6. Save results + inputs for the discrete event simulation
+# ---------------------------------------------------------------------
+write.csv(rbind(res_dur_np, res_dur_par), "type2_duration_results.csv", row.names = FALSE)
+write.csv(rbind(res_cnt, res_ia),         "type2_arrival_results.csv",  row.names = FALSE)
+write.csv(mc,                             "type2_montecarlo_results.csv", row.names = FALSE)
+
+# For the simulation: empirical durations (resample from these), daily counts,
+# and the fitted distribution (if the group prefers a parametric generator)
+type2_inputs <- list(durations_min = dur,
+                     daily_counts  = counts,
+                     interarrival_min = ia,
+                     call_times_by_day = split(t2$Time, factor(t2$DayIndex, levels = 0:(n_days - 1))),
+                     best_fit = best,
+                     fit_lognormal = fit_ln$estimate,
+                     fit_gamma = if (!is.null(fit_ga)) fit_ga$estimate else NULL)
+saveRDS(type2_inputs, "type2_inputs.rds")
+
+cat("\nDone. Figures in ./figures, tables as CSV, inputs in type2_inputs.rds\n")
